@@ -47,13 +47,31 @@ from queue import Queue
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+try:
+    from agents.tool_call_fallback import collect_tool_calls, format_text_tool_results
+except ModuleNotFoundError:
+    from tool_call_fallback import collect_tool_calls, format_text_tool_results
 
+# Load local .env variables so the scripts run without exporting env vars manually.
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
+
+# The Anthropic SDK can target Anthropic cloud or any compatible local server (like Ollama).
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+AUTH_TOKEN = os.getenv("ANTHROPIC_AUTH_TOKEN")
+
+if BASE_URL and not API_KEY:
+    if AUTH_TOKEN:
+        API_KEY = AUTH_TOKEN
+    elif "localhost:11434" in BASE_URL or "127.0.0.1:11434" in BASE_URL:
+        API_KEY = "ollama"
+
+if BASE_URL:
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# One client instance is reused for every model call in this process.
+client = Anthropic(base_url=BASE_URL, api_key=API_KEY)
 MODEL = os.environ["MODEL_ID"]
 
 TEAM_DIR = WORKDIR / ".team"
@@ -181,14 +199,40 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     for _ in range(30):
         resp = client.messages.create(model=MODEL, messages=sub_msgs, tools=sub_tools, max_tokens=8000)
         sub_msgs.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(resp.content)
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if resp.stop_reason != "tool_use" and not tool_calls:
             break
         results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                h = sub_handlers.get(b.name, lambda **kw: "Unknown tool")
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(h(**b.input))[:50000]})
-        sub_msgs.append({"role": "user", "content": results})
+        text_results = []
+        for call in tool_calls:
+            h = sub_handlers.get(call["name"], lambda **kw: "Unknown tool")
+            output = str(h(**call["input"]))[:50000]
+            if call["tool_use_id"]:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["tool_use_id"],
+                        "content": output,
+                    }
+                )
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": output}
+                )
+        if results:
+            sub_msgs.append({"role": "user", "content": results})
+        elif text_results:
+            sub_msgs.append(
+                {
+                    "role": "user",
+                    "content": format_text_tool_results(text_results),
+                }
+            )
+        else:
+            break
     if resp:
         return "".join(b.text for b in resp.content if hasattr(b, "text")) or "(no summary)"
     return "(subagent failed)"
@@ -469,28 +513,55 @@ class TeammateManager:
                     self._set_status(name, "shutdown")
                     return
                 messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
+                # Normalize tool calls: use structured tool_use blocks when available,
+                # otherwise parse XML-like fallback text emitted by some local models.
+                tool_calls = collect_tool_calls(response.content)
+                # If the model returned plain text (no tool calls), this turn is complete.
+                if response.stop_reason != "tool_use" and not tool_calls:
                     break
                 results = []
+                text_results = []
                 idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase."
-                        elif block.name == "claim_task":
-                            output = self.task_mgr.claim(block.input["task_id"], name)
-                        elif block.name == "send_message":
-                            output = self.bus.send(name, block.input["to"], block.input["content"])
-                        else:
-                            dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
-                                        "read_file": lambda **kw: run_read(kw["path"]),
-                                        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-                                        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
-                            output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                messages.append({"role": "user", "content": results})
+                for call in tool_calls:
+                    if call["name"] == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase."
+                    elif call["name"] == "claim_task":
+                        output = self.task_mgr.claim(call["input"]["task_id"], name)
+                    elif call["name"] == "send_message":
+                        output = self.bus.send(name, call["input"]["to"], call["input"]["content"])
+                    else:
+                        dispatch = {
+                            "bash": lambda **kw: run_bash(kw["command"]),
+                            "read_file": lambda **kw: run_read(kw["path"]),
+                            "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+                            "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+                        }
+                        output = dispatch.get(call["name"], lambda **kw: "Unknown")(**call["input"])
+                    print(f"  [{name}] {call['name']}: {str(output)[:120]}")
+                    if call["tool_use_id"]:
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call["tool_use_id"],
+                                "content": str(output),
+                            }
+                        )
+                    else:
+                        text_results.append(
+                            {"name": call["name"], "input": call["input"], "output": str(output)}
+                        )
+                if results:
+                    messages.append({"role": "user", "content": results})
+                elif text_results:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": format_text_tool_results(text_results),
+                        }
+                    )
+                else:
+                    break
                 if idle_requested:
                     break
             # -- IDLE PHASE: poll for messages and unclaimed tasks --
@@ -676,30 +747,58 @@ def agent_loop(messages: list):
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(response.content)
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if response.stop_reason != "tool_use" and not tool_calls:
             return
         # Tool execution
         results = []
+        text_results = []
         used_todo = False
         manual_compress = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compress":
-                    manual_compress = True
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                if block.name == "TodoWrite":
-                    used_todo = True
+        for call in tool_calls:
+            if call["name"] == "compress":
+                manual_compress = True
+            handler = TOOL_HANDLERS.get(call["name"])
+            try:
+                output = (
+                    handler(**call["input"])
+                    if handler
+                    else f"Unknown tool: {call['name']}"
+                )
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {call['name']}: {str(output)[:200]}")
+            if call["tool_use_id"]:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["tool_use_id"],
+                        "content": str(output),
+                    }
+                )
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": str(output)}
+                )
+            if call["name"] == "TodoWrite":
+                used_todo = True
         # s03: nag reminder (only when todo workflow is active)
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
-        if TODO.has_open_items() and rounds_without_todo >= 3:
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        messages.append({"role": "user", "content": results})
+        reminder_needed = TODO.has_open_items() and rounds_without_todo >= 3
+        if results:
+            if reminder_needed:
+                results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            messages.append({"role": "user", "content": results})
+        elif text_results:
+            text_payload = format_text_tool_results(text_results)
+            if reminder_needed:
+                text_payload = "<reminder>Update your todos.</reminder>\n\n" + text_payload
+            messages.append({"role": "user", "content": text_payload})
+        else:
+            return
         # s06: manual compress
         if manual_compress:
             print("[manual compact]")

@@ -95,6 +95,8 @@ One FSM, two applications. The same `pending -> approved | rejected` state machi
 ```sh
 cd learn-claude-code
 python agents/s10_team_protocols.py
+# or
+uv run python agents/s10_team_protocols.py
 ```
 
 1. `Spawn alice as a coder. Then request her shutdown.`

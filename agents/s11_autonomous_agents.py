@@ -44,13 +44,31 @@ from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+try:
+    from agents.tool_call_fallback import collect_tool_calls, format_text_tool_results
+except ModuleNotFoundError:
+    from tool_call_fallback import collect_tool_calls, format_text_tool_results
 
+# Load local .env variables so the scripts run without exporting env vars manually.
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
+
+# The Anthropic SDK can target Anthropic cloud or any compatible local server (like Ollama).
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+AUTH_TOKEN = os.getenv("ANTHROPIC_AUTH_TOKEN")
+
+if BASE_URL and not API_KEY:
+    if AUTH_TOKEN:
+        API_KEY = AUTH_TOKEN
+    elif "localhost:11434" in BASE_URL or "127.0.0.1:11434" in BASE_URL:
+        API_KEY = "ollama"
+
+if BASE_URL:
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# One client instance is reused for every model call in this process.
+client = Anthropic(base_url=BASE_URL, api_key=API_KEY)
 MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
@@ -234,24 +252,43 @@ class TeammateManager:
                     self._set_status(name, "idle")
                     return
                 messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
+                # Normalize tool calls: use structured tool_use blocks when available,
+                # otherwise parse XML-like fallback text emitted by some local models.
+                tool_calls = collect_tool_calls(response.content)
+                # If the model returned plain text (no tool calls), this turn is complete.
+                if response.stop_reason != "tool_use" and not tool_calls:
                     break
                 results = []
+                text_results = []
                 idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase. Will poll for new tasks."
-                        else:
-                            output = self._exec(name, block.name, block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                for call in tool_calls:
+                    if call["name"] == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase. Will poll for new tasks."
+                    else:
+                        output = self._exec(name, call["name"], call["input"])
+                    print(f"  [{name}] {call['name']}: {str(output)[:120]}")
+                    if call["tool_use_id"]:
                         results.append({
                             "type": "tool_result",
-                            "tool_use_id": block.id,
+                            "tool_use_id": call["tool_use_id"],
                             "content": str(output),
                         })
-                messages.append({"role": "user", "content": results})
+                    else:
+                        text_results.append(
+                            {"name": call["name"], "input": call["input"], "output": str(output)}
+                        )
+                if results:
+                    messages.append({"role": "user", "content": results})
+                elif text_results:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": format_text_tool_results(text_results),
+                        }
+                    )
+                else:
+                    break
                 if idle_requested:
                     break
 
@@ -526,23 +563,46 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(response.content)
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if response.stop_reason != "tool_use" and not tool_calls:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+        text_results = []
+        for call in tool_calls:
+            handler = TOOL_HANDLERS.get(call["name"])
+            try:
+                output = (
+                    handler(**call["input"])
+                    if handler
+                    else f"Unknown tool: {call['name']}"
+                )
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {call['name']}: {str(output)[:200]}")
+            if call["tool_use_id"]:
                 results.append({
                     "type": "tool_result",
-                    "tool_use_id": block.id,
+                    "tool_use_id": call["tool_use_id"],
                     "content": str(output),
                 })
-        messages.append({"role": "user", "content": results})
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": str(output)}
+                )
+        if results:
+            messages.append({"role": "user", "content": results})
+        elif text_results:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": format_text_tool_results(text_results),
+                }
+            )
+        else:
+            return
 
 
 if __name__ == "__main__":

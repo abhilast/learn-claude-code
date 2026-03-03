@@ -116,6 +116,8 @@ Transcripts preserve full history on disk. Nothing is truly lost -- just moved o
 ```sh
 cd learn-claude-code
 python agents/s06_context_compact.py
+# or
+uv run python agents/s06_context_compact.py
 ```
 
 1. `Read every Python file in the agents/ directory one by one` (watch micro-compact replace old results)

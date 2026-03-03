@@ -32,14 +32,31 @@ from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+try:
+    from agents.tool_call_fallback import collect_tool_calls, format_text_tool_results
+except ModuleNotFoundError:
+    from tool_call_fallback import collect_tool_calls, format_text_tool_results
 
+# Load local .env variables so the scripts run without exporting env vars manually.
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
+# The Anthropic SDK can target Anthropic cloud or any compatible local server (like Ollama).
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+AUTH_TOKEN = os.getenv("ANTHROPIC_AUTH_TOKEN")
+
+if BASE_URL and not API_KEY:
+    if AUTH_TOKEN:
+        API_KEY = AUTH_TOKEN
+    elif "localhost:11434" in BASE_URL or "127.0.0.1:11434" in BASE_URL:
+        API_KEY = "ollama"
+
+if BASE_URL:
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# One client instance is reused for every model call in this process.
+client = Anthropic(base_url=BASE_URL, api_key=API_KEY)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
@@ -169,25 +186,53 @@ def agent_loop(messages: list):
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(response.content)
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if response.stop_reason != "tool_use" and not tool_calls:
             return
         results = []
+        text_results = []
         used_todo = False
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                if block.name == "todo":
-                    used_todo = True
+        for call in tool_calls:
+            handler = TOOL_HANDLERS.get(call["name"])
+            try:
+                output = (
+                    handler(**call["input"])
+                    if handler
+                    else f"Unknown tool: {call['name']}"
+                )
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {call['name']}: {str(output)[:200]}")
+            if call["tool_use_id"]:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["tool_use_id"],
+                        "content": str(output),
+                    }
+                )
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": str(output)}
+                )
+            if call["name"] == "todo":
+                used_todo = True
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        messages.append({"role": "user", "content": results})
+        reminder_needed = rounds_since_todo >= 3
+        if results:
+            if reminder_needed:
+                results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            messages.append({"role": "user", "content": results})
+        elif text_results:
+            text_payload = format_text_tool_results(text_results)
+            if reminder_needed:
+                text_payload = "<reminder>Update your todos.</reminder>\n\n" + text_payload
+            messages.append({"role": "user", "content": text_payload})
+        else:
+            return
 
 
 if __name__ == "__main__":
