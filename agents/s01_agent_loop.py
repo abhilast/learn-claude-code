@@ -28,14 +28,31 @@ import subprocess
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+try:
+    from agents.tool_call_fallback import collect_tool_calls, format_text_tool_results
+except ModuleNotFoundError:
+    from tool_call_fallback import collect_tool_calls, format_text_tool_results
 
+# Load local .env variables so the scripts run without exporting env vars manually.
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
+# The Anthropic SDK can target Anthropic cloud or any compatible local server (like Ollama).
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+AUTH_TOKEN = os.getenv("ANTHROPIC_AUTH_TOKEN")
+
+if BASE_URL and not API_KEY:
+    if AUTH_TOKEN:
+        API_KEY = AUTH_TOKEN
+    elif "localhost:11434" in BASE_URL or "127.0.0.1:11434" in BASE_URL:
+        API_KEY = "ollama"
+
+if BASE_URL:
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+# One client instance is reused for every model call in this process.
+client = Anthropic(base_url=BASE_URL, api_key=API_KEY)
+MODEL = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
@@ -72,19 +89,46 @@ def agent_loop(messages: list):
         )
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(response.content)
         # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if response.stop_reason != "tool_use" and not tool_calls:
             return
-        # Execute each tool call, collect results
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
+        text_results = []
+        for call in tool_calls:
+            if call["name"] != "bash":
+                continue
+            command = call["input"].get("command", "")
+            print(f"\033[33m$ {command}\033[0m")
+            output = run_bash(command)
+            print(output[:200])
+            if call["tool_use_id"]:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["tool_use_id"],
+                        "content": output,
+                    }
+                )
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": output}
+                )
+        if results:
+            messages.append({"role": "user", "content": results})
+            continue
+        if text_results:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": format_text_tool_results(text_results),
+                }
+            )
+            continue
+        return
 
 
 if __name__ == "__main__":

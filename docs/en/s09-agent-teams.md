@@ -116,6 +116,8 @@ def _teammate_loop(self, name, role, prompt):
 ```sh
 cd learn-claude-code
 python agents/s09_agent_teams.py
+# or
+uv run python agents/s09_agent_teams.py
 ```
 
 1. `Spawn alice (coder) and bob (tester). Have alice send bob a message.`

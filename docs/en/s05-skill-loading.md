@@ -98,6 +98,8 @@ The model learns what skills exist (cheap) and loads them when relevant (expensi
 ```sh
 cd learn-claude-code
 python agents/s05_skill_loading.py
+# or
+uv run python agents/s05_skill_loading.py
 ```
 
 1. `What skills are available?`

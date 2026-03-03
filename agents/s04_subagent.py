@@ -28,15 +28,32 @@ from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+try:
+    from agents.tool_call_fallback import collect_tool_calls, format_text_tool_results
+except ModuleNotFoundError:
+    from tool_call_fallback import collect_tool_calls, format_text_tool_results
 
+# Load local .env variables so the scripts run without exporting env vars manually.
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
+# The Anthropic SDK can target Anthropic cloud or any compatible local server (like Ollama).
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+AUTH_TOKEN = os.getenv("ANTHROPIC_AUTH_TOKEN")
+
+if BASE_URL and not API_KEY:
+    if AUTH_TOKEN:
+        API_KEY = AUTH_TOKEN
+    elif "localhost:11434" in BASE_URL or "127.0.0.1:11434" in BASE_URL:
+        API_KEY = "ollama"
+
+if BASE_URL:
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+# One client instance is reused for every model call in this process.
+client = Anthropic(base_url=BASE_URL, api_key=API_KEY)
+MODEL = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
@@ -120,15 +137,44 @@ def run_subagent(prompt: str) -> str:
             tools=CHILD_TOOLS, max_tokens=8000,
         )
         sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(response.content)
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if response.stop_reason != "tool_use" and not tool_calls:
             break
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+        text_results = []
+        for call in tool_calls:
+            handler = TOOL_HANDLERS.get(call["name"])
+            output = (
+                handler(**call["input"])
+                if handler
+                else f"Unknown tool: {call['name']}"
+            )
+            if call["tool_use_id"]:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["tool_use_id"],
+                        "content": str(output)[:50000],
+                    }
+                )
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": str(output)}
+                )
+        if results:
+            sub_messages.append({"role": "user", "content": results})
+        elif text_results:
+            sub_messages.append(
+                {
+                    "role": "user",
+                    "content": format_text_tool_results(text_results),
+                }
+            )
+        else:
+            break
     # Only the final text returns to the parent -- child context is discarded
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
@@ -147,21 +193,50 @@ def agent_loop(messages: list):
             tools=PARENT_TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # Normalize tool calls: use structured tool_use blocks when available,
+        # otherwise parse XML-like fallback text emitted by some local models.
+        tool_calls = collect_tool_calls(response.content)
+        # If the model returned plain text (no tool calls), this turn is complete.
+        if response.stop_reason != "tool_use" and not tool_calls:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
-                    output = run_subagent(block.input["prompt"])
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        text_results = []
+        for call in tool_calls:
+            if call["name"] == "task":
+                desc = call["input"].get("description", "subtask")
+                print(f"> task ({desc}): {call['input'].get('prompt', '')[:80]}")
+                output = run_subagent(call["input"]["prompt"])
+            else:
+                handler = TOOL_HANDLERS.get(call["name"])
+                output = (
+                    handler(**call["input"])
+                    if handler
+                    else f"Unknown tool: {call['name']}"
+                )
+            print(f"  {str(output)[:200]}")
+            if call["tool_use_id"]:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["tool_use_id"],
+                        "content": str(output),
+                    }
+                )
+            else:
+                text_results.append(
+                    {"name": call["name"], "input": call["input"], "output": str(output)}
+                )
+        if results:
+            messages.append({"role": "user", "content": results})
+        elif text_results:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": format_text_tool_results(text_results),
+                }
+            )
+        else:
+            return
 
 
 if __name__ == "__main__":

@@ -85,6 +85,8 @@ The child's entire message history (possibly 30+ tool calls) is discarded. The p
 ```sh
 cd learn-claude-code
 python agents/s04_subagent.py
+# or
+uv run python agents/s04_subagent.py
 ```
 
 1. `Use a subtask to find what testing framework this project uses`
