@@ -66,7 +66,7 @@ if BASE_URL:
 WORKDIR = Path.cwd()
 # One client instance is reused for every model call in this process.
 client = Anthropic(base_url=BASE_URL, api_key=API_KEY)
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 SKILLS_DIR = WORKDIR / "skills"
 
 
